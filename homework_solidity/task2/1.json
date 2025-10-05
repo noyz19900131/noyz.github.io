@@ -1,0 +1,11 @@
+{
+	"name": "My NFT #1",
+	"description": "This is NFT metadata",
+	"image": "https://gateway.pinata.cloud/ipfs/bafybeiby4vq6y3nse5dteecpi2gltd6n6bpxarn7t4k4ehrldhwqt6oooi",
+	"attributes": [
+		{
+			"trait_type": "Artist",
+			"value": "Kim"
+		}
+	]
+}
