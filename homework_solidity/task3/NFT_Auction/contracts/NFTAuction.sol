@@ -7,164 +7,158 @@ import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "./INFTAuctionFactory.sol";
+import "./INFTAuction.sol";
 
-contract NFTAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable {
+contract NFTAuction is
+    Initializable,
+    UUPSUpgradeable,
+    OwnableUpgradeable,
+    INFTAuction
+{
     struct Auction {
-        address seller; // 卖家
-        uint256 duration; // 拍卖持续时间
-        uint256 startPrice; // 起始价格
-        uint256 startTime; // 开始时间
-        bool ended; // 是否结束
-        address highestBidder; // 最高出价者
-        uint256 highestBid; // 最高出价
-        address nftContract; // NFT合约地址
-        uint256 tokenId; // NFT ID
-        address bidTokenAddress; // 参与竞价的资产类型
+        address seller;
+        uint256 duration;
+        uint256 startPrice;
+        uint256 startPriceUSD;
+        uint256 startTime;
+        bool ended;
+        address highestBidder;
+        uint256 highestBid;
+        uint256 highestBidUSD;
+        address nftContract;
+        uint256 tokenId;
+        address bidTokenAddress; // 参与竞价的资产地址（ETH=address(0)）
     }
 
-    mapping(uint256 => Auction) public auctions; // 状态变量
-    uint256 public nextAuctionId; // 下一个拍卖ID
-    mapping(address => AggregatorV3Interface) public priceFeeds; // 价格预言机
-    mapping(address => uint256) public priceFeedDecimals; // 价格预言机小数位数
+    Auction public auction;
+    address public factory;
+    mapping(address => AggregatorV3Interface) public priceFeeds;
+    mapping(address => uint256) public priceFeedDecimals;
 
-    // 事件
     event AuctionCreated(
-        uint256 indexed auctionId,
+        address indexed auctionContract,
         address indexed nftContract,
         uint256 indexed tokenId,
+        address seller,
         uint256 startPrice,
+        uint256 startPriceUSD,
         uint256 duration,
         address bidTokenAddress
     );
     event BidPlaced(
-        uint256 indexed auctionId,
+        address indexed auctionContract,
         address indexed bidder,
         uint256 bidAmount,
+        uint256 bidAmountUSD,
         address bidTokenAddress
     );
     event AuctionEnded(
-        uint256 indexed auctionId,
+        address indexed auctionContract,
         address indexed highestBidder,
+        address indexed seller,
         uint256 highestBid,
         address bidTokenAddress
     );
 
-    function initialize() public initializer {
+    // 初始化
+    function initialize(AuctionInitParams calldata params) public initializer {
         __Ownable_init();
-        nextAuctionId = 0;
-    }
+        _transferOwnership(params.seller);
+        __UUPSUpgradeable_init();
 
-    // 设置 ETH 价格预言机
-    function setPriceFeed(
-        address tokenAddress,
-        address _priceETHFeed,
-        uint256 _decimals
-    ) public onlyOwner {
-        require(_priceETHFeed != address(0), "Invalid price feed address");
-        require(_decimals > 0, "Decimals must be greater than 0");
-        priceFeeds[tokenAddress] = AggregatorV3Interface(_priceETHFeed);
-        priceFeedDecimals[tokenAddress] = _decimals;
-    }
-
-    // 获取最新的 ETH 价格
-    function getLatestPrice(
-        address tokenAddress
-    ) public view returns (uint256 price, uint256 decimals) {
-        AggregatorV3Interface priceFeed = priceFeeds[tokenAddress];
-        require(address(priceFeed) != address(0), "Price feed not set");
-        decimals = priceFeedDecimals[tokenAddress];
-        require(decimals > 0, "Invalid decimals");
-
-        (, int256 answer, , , ) = priceFeed.latestRoundData();
-        require(answer > 0, "Invalid price");
-        price = uint256(answer);
-        return (price, decimals);
-    }
-
-    // 创建拍卖
-    function createAuction(
-        uint256 _duration,
-        uint256 _startPrice,
-        address _nftContract,
-        uint256 _tokenId,
-        address _bidTokenAddress
-    ) external onlyOwner {
-        // 参数校验
-        require(_duration >= 10, "Duration must be greater than 10s");
-        require(_startPrice > 0, "Start price must be greater than 0");
-        require(_nftContract != address(0), "Invalid NFT contract address");
-        require(_tokenId > 0, "Invalid token ID");
-
-        // NFT 授权校验
-        IERC721 nft = IERC721(_nftContract);
+        require(params.duration > 10, "Duration>10");
+        require(params.startPrice > 0, "StartPrice>0");
+        require(params.nftContract != address(0), "Invalid NFT");
+        require(params.tokenId > 0, "TokenId>0");
+        require(params.factory != address(0), "Invalid Factory");
+        require(params.priceFeed != address(0), "Invalid Feed");
+        require(params.feedDecimals > 0, "FeedDec>0");
         require(
-            nft.isApprovedForAll(msg.sender, address(this)) ||
-                nft.getApproved(_tokenId) == address(this),
-            "Contract not approved to transfer NFT"
+            params.seller ==
+                IERC721(params.nftContract).ownerOf(params.tokenId),
+            "Seller is not NFT Owner"
         );
 
-        // 转移NFT到合约
-        IERC721(_nftContract).safeTransferFrom(
-            msg.sender,
+        priceFeeds[params.bidTokenAddress] = AggregatorV3Interface(
+            params.priceFeed
+        );
+        priceFeedDecimals[params.bidTokenAddress] = params.feedDecimals;
+
+        uint256 startPriceUSD = _calculateBidUSDValue(
+            params.bidTokenAddress,
+            params.startPrice
+        );
+        require(startPriceUSD > 0, "startPriceUSD > 0");
+
+        IERC721 nft = IERC721(params.nftContract);
+        require(
+            nft.isApprovedForAll(params.seller, address(this)) ||
+                nft.getApproved(params.tokenId) == address(this),
+            "No NFT Approval"
+        );
+
+        IERC721(params.nftContract).safeTransferFrom(
+            params.seller,
             address(this),
-            _tokenId
+            params.tokenId
         );
 
-        auctions[nextAuctionId] = Auction(
-            msg.sender,
-            _duration,
-            _startPrice,
+        auction = Auction(
+            params.seller,
+            params.duration,
+            params.startPrice,
+            startPriceUSD,
             block.timestamp,
             false,
             address(0),
             0,
-            _nftContract,
-            _tokenId,
-            _bidTokenAddress
+            0,
+            params.nftContract,
+            params.tokenId,
+            params.bidTokenAddress
         );
+
+        factory = params.factory;
 
         emit AuctionCreated(
-            nextAuctionId,
-            _nftContract,
-            _tokenId,
-            _startPrice,
-            _duration,
-            _bidTokenAddress
+            address(this),
+            params.nftContract,
+            params.tokenId,
+            params.seller,
+            params.startPrice,
+            startPriceUSD,
+            params.duration,
+            params.bidTokenAddress
         );
-
-        nextAuctionId++;
     }
 
-    // 买家参与买单
-    function placeBid(uint256 _auctionId, uint256 _bidAmount) external payable {
-        Auction storage auction = auctions[_auctionId];
-        // 判断当前拍卖是否结束
-        require(!auction.ended, "Auction has ended");
+    // 买家竞拍
+    function placeBid(uint256 _bidAmount) external payable {
+        require(!auction.ended, "Auction ended");
         require(
             block.timestamp < auction.startTime + auction.duration,
-            "Auction timed out"
-        );
-        // 判断出价是否大于当前最高出价
-        require(
-            _bidAmount > auction.highestBid,
-            "Bid must be higher than current highest bid"
-        );
-        // 判断出价是否大于起拍价
-        require(
-            _bidAmount >= auction.startPrice,
-            "Bid must be higher than start price"
+            "Auction timeout"
         );
 
-        // 1. 退还前最高出价者的资金（区分ETH/ERC20）
+        uint256 bidUSD = _calculateBidUSDValue(
+            auction.bidTokenAddress,
+            _bidAmount
+        );
+        require(bidUSD > auction.highestBidUSD, "BidUSD not highest");
+        require(bidUSD >= auction.startPriceUSD, "BidUSD < StartUSD");
+
+        // 1. 退还前最高出价者的资金
         if (auction.highestBidder != address(0)) {
             if (auction.bidTokenAddress == address(0)) {
-                // ETH退款
+                // ETH
                 (bool success, ) = payable(auction.highestBidder).call{
                     value: auction.highestBid
                 }("");
                 require(success, "Failed to refund ETH");
             } else {
-                // ERC20退款
+                // ERC20
                 IERC20 erc20 = IERC20(auction.bidTokenAddress);
                 require(
                     erc20.transfer(auction.highestBidder, auction.highestBid),
@@ -173,14 +167,13 @@ contract NFTAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             }
         }
 
-        // 2. 接收当前出价者的资金（区分ETH/ERC20）
+        // 2. 接收当前出价者的资金
         if (auction.bidTokenAddress == address(0)) {
-            // ETH出价
+            // ETH
             require(msg.value == _bidAmount, "ETH amount mismatch");
         } else {
-            // ERC20出价
+            // ERC20
             IERC20 erc20 = IERC20(auction.bidTokenAddress);
-            // 校验出价者是否授权了足够的ERC20代币
             require(
                 erc20.allowance(msg.sender, address(this)) >= _bidAmount,
                 "Insufficient ERC20 allowance"
@@ -191,50 +184,54 @@ contract NFTAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             );
         }
 
-        // 更新拍卖信息
         auction.highestBid = _bidAmount;
+        auction.highestBidUSD = bidUSD;
         auction.highestBidder = msg.sender;
 
         emit BidPlaced(
-            _auctionId,
+            address(this),
             msg.sender,
             _bidAmount,
+            bidUSD,
             auction.bidTokenAddress
         );
     }
 
     // 结束拍卖
-    function endAuction(uint256 _auctionId) external {
-        Auction storage auction = auctions[_auctionId];
-        // 判断拍卖是否结束
-        require(!auction.ended, "Auction already ended");
+    function endAuction() external {
+        address caller = msg.sender;
+        require(
+            caller == auction.seller ||
+                caller == auction.highestBidder ||
+                caller == factory,
+            "No end perm"
+        );
+
+        require(!auction.ended, "Auction ended");
         require(
             block.timestamp >= auction.startTime + auction.duration,
-            "Auction not timed out"
+            "Auction not timeout"
         );
-        require(auction.nftContract != address(0), "Auction does not exist");
+        require(auction.nftContract != address(0), "Auction not exist");
 
-        // 标记拍卖已结束
         auction.ended = true;
 
-        // 处理NFT和资金：分两种情况（有出价/无出价）
         if (auction.highestBidder != address(0)) {
-            // 情况1：有出价 → NFT转给最高出价者，资金转给卖家
             IERC721(auction.nftContract).safeTransferFrom(
                 address(this),
                 auction.highestBidder,
                 auction.tokenId
             );
 
-            // 转移资金（区分ETH/ERC20）
+            // 转移资金
             if (auction.bidTokenAddress == address(0)) {
-                // ETH资金转移
+                // ETH
                 (bool success, ) = payable(auction.seller).call{
-                    value: address(this).balance
+                    value: auction.highestBid
                 }("");
                 require(success, "Failed to transfer ETH to seller");
             } else {
-                // ERC20资金转移
+                // ERC20
                 IERC20 erc20 = IERC20(auction.bidTokenAddress);
                 uint256 erc20Balance = erc20.balanceOf(address(this));
                 require(
@@ -243,7 +240,6 @@ contract NFTAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable {
                 );
             }
         } else {
-            // 情况2：无出价 → NFT还给卖家（避免NFT卡住）
             IERC721(auction.nftContract).safeTransferFrom(
                 address(this),
                 auction.seller,
@@ -251,19 +247,46 @@ contract NFTAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable {
             );
         }
 
+        INFTAuctionFactory(factory).clearAuctionMap(
+            auction.nftContract,
+            auction.tokenId
+        );
+
         emit AuctionEnded(
-            _auctionId,
+            address(this),
             auction.highestBidder,
+            auction.seller,
             auction.highestBid,
             auction.bidTokenAddress
         );
     }
 
-    // UUPS升级授权（仅owner可升级）
+    // 辅助函数：计算出价的 USD 价值
+    function _calculateBidUSDValue(
+        address _tokenAddress,
+        uint256 _amount
+    ) internal view returns (uint256) {
+        AggregatorV3Interface feed = priceFeeds[_tokenAddress];
+        require(
+            address(feed) != address(0),
+            "Price feed not set for bid token"
+        );
+
+        (, int256 priceRaw, , , ) = feed.latestRoundData();
+        require(priceRaw > 0, "Invalid price from feed");
+        uint256 price = uint256(priceRaw);
+        uint256 feedDecimal = priceFeedDecimals[_tokenAddress];
+
+        uint256 tokenDecimal = (_tokenAddress == address(0))
+            ? 18
+            : IERC20Metadata(_tokenAddress).decimals();
+
+        return ((_amount * price) / (10 ** (tokenDecimal + feedDecimal))) * 1e8;
+    }
+
     function _authorizeUpgrade(
         address newImplementation
     ) internal override onlyOwner {}
 
-    // 接收ETH
     receive() external payable {}
 }
